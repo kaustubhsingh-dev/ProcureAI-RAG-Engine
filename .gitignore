@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+
+# Data & Databases (Generated Locally)
+raw_pdfs/
+archive_pdfs/
+data/
+chroma_db/
+*.pdf
+*.sqlite3
+
+# OS
+.DS_Store

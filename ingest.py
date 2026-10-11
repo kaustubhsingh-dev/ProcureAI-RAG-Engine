@@ -1,7 +1,7 @@
 import os
 import shutil
 import re
-from langchain_text_splitters import MarkdownHeaderTextSplitter
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 
@@ -42,6 +42,8 @@ def main():
         ("##", "Page")
     ]
     markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
+    # Secondary splitter to keep chunks strictly under all-MiniLM-L6-v2 context limits (256 tokens)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     
     all_chunks = []
     
@@ -49,12 +51,17 @@ def main():
     for file_path in markdown_files:
         content, file_metadata = parse_markdown_with_metadata(file_path)
         
-        doc_chunks = markdown_splitter.split_text(content)
-        for chunk in doc_chunks:
-            chunk.metadata.update(file_metadata)
-            all_chunks.append(chunk)
+        # 1. Structural page split
+        page_chunks = markdown_splitter.split_text(content)
+        
+        # 2. Token-safe sub-chunking
+        for page_chunk in page_chunks:
+            sub_chunks = text_splitter.split_documents([page_chunk])
+            for sub in sub_chunks:
+                sub.metadata.update(file_metadata)
+                all_chunks.append(sub)
 
-    print(f"Created {len(all_chunks)} table-safe chunks with attached cross-reference metadata.")
+    print(f"Created {len(all_chunks)} sub-chunks fitted for vector embedding context limits.")
     print("Generating embeddings and building the final ChromaDB...")
     
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")

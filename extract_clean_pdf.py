@@ -1,28 +1,39 @@
 import os
 import re
+import shutil
 import fitz   
 import pdfplumber
 from pathlib import Path
 
 INPUT_FOLDER = "raw_pdfs"    
 OUTPUT_FOLDER = "data"       
+ARCHIVE_FOLDER = "archive_pdfs"
+
+# --- OCR TYPO CORRECTIONS ---
+# Add new entries here as new document-specific typos are discovered.
+# Pattern -> Replacement (case-insensitive)
+KNOWN_OCR_FIXES = {
+    r'\bCat-bon\b': 'Carbon',
+    r'\bCat-bot\b': 'Carbon',
+    r'\bCatbon\b': 'Carbon',
+    r'\bfimm\+\b': 'following',
+    r'\~e4\~5': 'Fe 415',
+    r'\~e yJj': 'Fe 500',
+}
 
 def clean_text(text):
-    """Strips watermarks, fixes OCR line breaks, and corrects common table header typos."""
+    """Strips watermarks, applies known OCR typo fixes, and normalizes spacing."""
     watermark_pattern = r"Free Standard provided by BIS via BSB Edge Private Limited.*?\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\."
     text = re.sub(watermark_pattern, "", text, flags=re.DOTALL | re.IGNORECASE)
     
     reaffirmed_pattern = r"\(Reaffirmed\s*\d{4}\)"
     text = re.sub(reaffirmed_pattern, "", text, flags=re.IGNORECASE)
     
-    text = re.sub(r'Cat-bon', 'Carbon', text, flags=re.IGNORECASE)
-    text = re.sub(r'Cat-bot', 'Carbon', text, flags=re.IGNORECASE)
-    text = re.sub(r'Catbon', 'Carbon', text, flags=re.IGNORECASE)
-    text = re.sub(r'Sulphur', 'Sulphur', text, flags=re.IGNORECASE)  
-    text = re.sub(r'Phosphorus', 'Phosphorus', text, flags=re.IGNORECASE)
-    text = re.sub(r'fimm\+', 'following', text, flags=re.IGNORECASE)
-    text = re.sub(r'\~e4\~5', 'Fe 415', text, flags=re.IGNORECASE)
-    text = re.sub(r'\~e yJj', 'Fe 500', text, flags=re.IGNORECASE)
+    # Apply documented OCR corrections
+    for pattern, replacement in KNOWN_OCR_FIXES.items():
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    
+    # Systemic spacing fixes
     text = re.sub(r'(?<!\n)\n([a-z])', r' \1', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
@@ -52,20 +63,50 @@ def format_table(table_data):
     return table_str + "\n"
 
 def extract_metadata(full_text):
-    """STRESS-TEST FIX: Hunts for Clause 2 and extracts mandatory IS Codes"""
+    """
+    Hunts for Clause 2 (References / Normative References).
+    Uses a HYBRID regex that captures BOTH:
+      - Explicit "IS xxx" references
+      - Bare "xxx:yyyy" references (colon-year = definitely a standard, not a random number)
+    This avoids the earlier year-range filter that would incorrectly exclude valid codes like IS 2062.
+    """
     refs = "None identified"
-    match = re.search(r'2\.?\s*Normative References(.*?)(?:3\.?\s*Terms and Definitions|4\.?\s*General)', full_text, flags=re.IGNORECASE | re.DOTALL)
     
-    if match:
-        block = match.group(1)
-        is_codes = re.findall(r'IS\s*\d+(?:\s*\(\s*Part\s*\d+\s*\))?', block, flags=re.IGNORECASE)
-        if is_codes:
-            is_codes = list(set([code.replace('\n', '').strip() for code in is_codes]))
-            refs = ", ".join(is_codes)
+    patterns = [
+        r'2\.?\s*(?:NORMATIVE\s+)?REFERENCES?(.*?)(?:\n\s*3\.?\s*(?:TERMINOLOGY|TERMS|DEFINITIONS|MATERIAL|GENERAL)|4\.?\s*(?:GENERAL|MATERIAL|REQUIREMENTS))',
+        r'2\.?\s*(?:NORMATIVE\s+)?REFERENCES?(.*?)(?:\n\s*3\.)',
+        r'REFERENCES?(.*?)(?:TERMINOLOGY|TERMS\s+AND\s+DEFINITIONS)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, full_text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            block = match.group(1)[:4000]
             
+            # Pattern A: Explicit "IS xxx" or "IS: xxx"
+            explicit = re.findall(r'\bIS\s*[:]?\s*(\d{1,5})\b', block, flags=re.IGNORECASE)
+            
+            # Pattern B: Bare "xxx:yyyy" (colon followed by a 4-digit year → definitely a standard)
+            with_year = re.findall(r'\b(\d{1,5})\s*:\s*(?:19|20)\d{2}\b', block)
+            
+            # Merge and deduplicate while preserving order
+            seen = set()
+            flat_codes = []
+            for c in explicit + with_year:
+                if c not in seen:
+                    seen.add(c)
+                    flat_codes.append(c)
+            
+            if flat_codes:
+                # Sort numerically for consistent output
+                unique_codes = sorted(set(flat_codes), key=int)
+                formatted = [f"IS {code}" for code in unique_codes]
+                refs = ", ".join(formatted[:15])
+                break
+    
     return refs
 
-def process_pdf(pdf_path, output_path):
+def process_pdf(pdf_path, output_path, archive_path):
     print(f"Processing: {os.path.basename(pdf_path)}...")
     
     try:
@@ -109,14 +150,19 @@ def process_pdf(pdf_path, output_path):
                 f.write("\n")
         
         doc.close()
-        os.remove(pdf_path)
-        print(f"✅ Saved: {output_path} | Associated References: {normative_refs}")
+
+        # Safe move: overwrite if archive already has a copy
+        if os.path.exists(archive_path):
+            os.remove(archive_path)
+        shutil.move(pdf_path, archive_path)
+        print(f"✅ Saved: {output_path} | Archived: {archive_path} | References: {normative_refs}")
 
     except Exception as e:
         print(f"❌ ERROR processing {os.path.basename(pdf_path)}: {e}")
 
 def main():
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    os.makedirs(ARCHIVE_FOLDER, exist_ok=True)
     pdf_files = list(Path(INPUT_FOLDER).glob("*.pdf"))
     
     if not pdf_files:
@@ -126,9 +172,10 @@ def main():
     print(f"Found {len(pdf_files)} PDFs to process.\n")
     for pdf_file in pdf_files:
         output_file = os.path.join(OUTPUT_FOLDER, pdf_file.stem + ".md")
-        process_pdf(str(pdf_file), output_file)
+        archive_file = os.path.join(ARCHIVE_FOLDER, pdf_file.name)
+        process_pdf(str(pdf_file), output_file, archive_file)
     
-    print("\n🎉 All PDFs processed. Converted files are in 'data'.")
+    print("\n🎉 All PDFs processed. Converted files are in 'data' and source files are safely archived.")
 
 if __name__ == "__main__":
     main()
